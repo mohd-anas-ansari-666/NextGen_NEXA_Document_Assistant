@@ -22,9 +22,9 @@ db = client["pdf_embeddings"]
 collection = db["documents"]
 
 # Load embedding model
-# embedding_model = GoogleGenerativeAIEmbeddings(model="embedding-001")
 embedding_model = GoogleGenerativeAIEmbeddings(
         model="models/embedding-001")
+
 def extract_text(pdf_path):
     """Extracts text from PDF and returns it as a string."""
     text = ""
@@ -72,14 +72,28 @@ def generate_embeddings(chunks):
     """Generates embeddings for text chunks using Gemini."""
     return embedding_model.embed_documents(chunks)
 
-def store_in_mongodb(pdf_name, text_chunks, embeddings, tables, images):
-    """Stores extracted content into MongoDB."""
+def store_text_chunk_in_mongodb(pdf_name, chunk, embeddings):
+    """Stores a single text chunk and its embeddings into MongoDB."""
     data = {
         "pdf_name": pdf_name,
-        "text_chunks": text_chunks,
-        "embeddings": embeddings,
-        "tables": tables,
-        "images": images
+        "chunk_text": chunk,
+        "embeddings": embeddings
+    }
+    collection.insert_one(data)
+
+def store_image_in_mongodb(pdf_name, image_path):
+    """Stores an image reference in MongoDB."""
+    data = {
+        "pdf_name": pdf_name,
+        "image_path": image_path
+    }
+    collection.insert_one(data)
+
+def store_table_in_mongodb(pdf_name, table_data):
+    """Stores a table reference in MongoDB."""
+    data = {
+        "pdf_name": pdf_name,
+        "table_data": table_data
     }
     collection.insert_one(data)
 
@@ -91,11 +105,20 @@ def process_pdf(pdf_path):
     embeddings = generate_embeddings(text_chunks)
     tables = extract_tables(pdf_path)
     images = extract_images(pdf_path)
-    image_texts = [perform_ocr(img) for img in images]
-    store_in_mongodb(pdf_name, text_chunks + image_texts, embeddings, tables, images)
+    # image_texts = [perform_ocr(img) for img in images]
+    for chunk, embeddings in zip(text_chunks, embeddings):
+        store_text_chunk_in_mongodb(pdf_name, chunk, embeddings) #text_chunks+image_texts
+     # Store images in MongoDB
+    for img_path in images:
+        store_image_in_mongodb(pdf_name, img_path)
+    
+    # Store tables in MongoDB
+    for table in tables:
+        store_table_in_mongodb(pdf_name, table)
+        
     print(f"PDF {pdf_name} processed and stored in MongoDB.")
 
 # Example Usage
 if __name__ == "__main__":
-    pdf_path = "testSummary.pdf"  # Replace with your PDF file path
+    pdf_path = r"C:\Users\HP\Desktop\V3.0\NextGenNEXA_Doc_Assistant\Missile Guidance And Control Systems.pdf"
     process_pdf(pdf_path)
