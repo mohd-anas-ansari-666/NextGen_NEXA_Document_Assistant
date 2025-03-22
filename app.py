@@ -10,6 +10,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Load environment variables and configure Google Generative AI
 load_dotenv()
@@ -20,6 +21,10 @@ genai.configure(api_key=api_key)
 client = MongoClient("mongodb://localhost:27017/")
 db = client["pdf_embeddings"]
 collection = db["documents"]
+
+# Ensure indexing for faster retrieval
+collection.create_index("pdf_name")
+collection.create_index("chunk_text")
 
 # Load embedding model
 embedding_model = GoogleGenerativeAIEmbeddings(
@@ -74,6 +79,11 @@ def generate_embeddings(chunks):
 
 def store_text_chunk_in_mongodb(pdf_name, chunk, embeddings):
     """Stores a single text chunk and its embeddings into MongoDB."""
+
+    # Make sure the embedding is a list for proper MongoDB storage
+    if isinstance(embeddings, np.ndarray):
+        embeddings = embeddings.tolist()
+
     data = {
         "pdf_name": pdf_name,
         "chunk_text": chunk,
@@ -97,6 +107,53 @@ def store_table_in_mongodb(pdf_name, table_data):
     }
     collection.insert_one(data)
 
+def find_similar_chunks(query):
+    """Finds the most similar text chunk for a given query using cosine similarity."""
+    # Get query embedding as a 1D array
+    query_embedding = np.array(embedding_model.embed_documents([query])[0])
+    
+    docs = list(collection.find({}, {"chunk_text": 1, "embeddings": 1, "_id": 0}))
+    
+    best_match = None
+    best_score = -1
+    
+    for doc in docs:
+        if "chunk_text" in doc and "embeddings" in doc:
+            # Ensure we're dealing with a single chunk and its embedding
+            chunk = doc["chunk_text"]
+            emb = np.array(doc["embeddings"])
+            
+            # Make sure embeddings are correctly shaped
+            if isinstance(chunk, list) and isinstance(emb, list):
+                # Handle case where we have lists of chunks and embeddings
+                for c, e in zip(chunk, emb):
+                    e = np.array(e)
+                    if e.ndim == 1:  # If embedding is already 1D
+                        score = cosine_similarity([query_embedding], [e])[0][0]
+                    else:
+                        # Try to flatten or reshape as needed
+                        e = e.flatten() if e.ndim > 2 else e
+                        score = cosine_similarity([query_embedding], [e])[0][0]
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_match = c
+            else:
+                # Handle single chunk case
+                emb = np.array(emb)
+                if emb.ndim == 1:  # If embedding is already 1D
+                    score = cosine_similarity([query_embedding], [emb])[0][0]
+                else:
+                    # Try to flatten or reshape as needed
+                    emb = emb.flatten() if emb.ndim > 2 else emb
+                    score = cosine_similarity([query_embedding], [emb])[0][0]
+                
+                if score > best_score:
+                    best_score = score
+                    best_match = chunk
+    
+    return best_match, best_score
+
 # Main processing function
 def process_pdf(pdf_path):
     pdf_name = os.path.basename(pdf_path)
@@ -106,8 +163,12 @@ def process_pdf(pdf_path):
     tables = extract_tables(pdf_path)
     images = extract_images(pdf_path)
     # image_texts = [perform_ocr(img) for img in images]
-    for chunk, embeddings in zip(text_chunks, embeddings):
-        store_text_chunk_in_mongodb(pdf_name, chunk, embeddings) #text_chunks+image_texts
+    # for chunk, embeddings in zip(text_chunks, embeddings):
+    #     store_text_chunk_in_mongodb(pdf_name, chunk, embeddings) #text_chunks+image_texts
+
+    for i, chunk in enumerate(text_chunks):
+        store_text_chunk_in_mongodb(pdf_name, chunk, embeddings[i])
+
      # Store images in MongoDB
     for img_path in images:
         store_image_in_mongodb(pdf_name, img_path)
@@ -115,10 +176,15 @@ def process_pdf(pdf_path):
     # Store tables in MongoDB
     for table in tables:
         store_table_in_mongodb(pdf_name, table)
-        
+
     print(f"PDF {pdf_name} processed and stored in MongoDB.")
 
 # Example Usage
 if __name__ == "__main__":
     pdf_path = r"C:\Users\HP\Desktop\V3.0\NextGenNEXA_Doc_Assistant\Missile Guidance And Control Systems.pdf"
     process_pdf(pdf_path)
+
+    # Example Query Search
+    query = "Missile guidance systems"
+    match, score = find_similar_chunks(query)
+    print(f"Best match: {match} (Score: {score})")
