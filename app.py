@@ -1,190 +1,233 @@
-import fitz  # PyMuPDF for text and image extraction
-import pdfplumber  # For table extraction
-import pytesseract  # OCR for images
-from PIL import Image
+import fitz  # PyMuPDF for text extraction
 import os
 import numpy as np
 from pymongo import MongoClient
 import google.generativeai as genai
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI 
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
 from sklearn.metrics.pairwise import cosine_similarity
+from datetime import datetime
 
-# Load environment variables and configure Google Generative AI
+# Load environment variables
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=api_key)
 
 # Initialize MongoDB connection
 client = MongoClient("mongodb://localhost:27017/")
-db = client["pdf_embeddings"]
-collection = db["documents"]
+db = client["pdf_db"]
+collection = db["pdf_chunks"]
+chat_history = db["chat_history"]
 
-# Ensure indexing for faster retrieval
+# Create indexes for faster retrieval
 collection.create_index("pdf_name")
 collection.create_index("chunk_text")
 
-# Load embedding model
-embedding_model = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001")
+# Initialize models
+embedding_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+chat_model = ChatGoogleGenerativeAI(
+    model="gemini-1.5-flash-8b",
+    temperature=0.3,
+    max_output_tokens=2048,
+    top_p=0.95,
+    top_k=40
+)
 
-def extract_text(pdf_path):
-    """Extracts text from PDF and returns it as a string."""
+def extract_text_from_pdf(pdf_path):
+    """Extract all text from a PDF file"""
     text = ""
     with fitz.open(pdf_path) as doc:
         for page in doc:
             text += page.get_text("text") + "\n"
     return text
 
-def extract_images(pdf_path, output_folder="images"):
-    """Extracts images from PDF and saves them locally."""
-    os.makedirs(output_folder, exist_ok=True)
-    images = []
-    with fitz.open(pdf_path) as doc:
-        for i, page in enumerate(doc):
-            for img_index, img in enumerate(page.get_images(full=True)):
-                xref = img[0]
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                img_path = os.path.join(output_folder, f"page_{i}_img_{img_index}.png")
-                with open(img_path, "wb") as f:
-                    f.write(image_bytes)
-                images.append(img_path)
-    return images
-
-def extract_tables(pdf_path):
-    """Extracts tables and returns them as JSON."""
-    tables = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            for table in page.extract_tables():
-                tables.append(table)
-    return tables
-
-def perform_ocr(image_path):
-    """Performs OCR on an image and returns extracted text."""
-    image = Image.open(image_path)
-    return pytesseract.image_to_string(image)
-
-def chunk_text(text):
-    """Splits text into smaller chunks using LangChain."""
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
+def create_text_chunks(text):
+    """Split text into manageable chunks with overlap"""
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=10000,
+        chunk_overlap=1000
+    )
     return text_splitter.split_text(text)
 
-def generate_embeddings(chunks):
-    """Generates embeddings for text chunks using Gemini."""
+def embed_chunks(chunks):
+    """Generate embeddings for text chunks"""
     return embedding_model.embed_documents(chunks)
 
-def store_text_chunk_in_mongodb(pdf_name, chunk, embeddings):
-    """Stores a single text chunk and its embeddings into MongoDB."""
+def store_chunks_in_db(pdf_name, chunks, embeddings):
+    """Store chunks and their embeddings in MongoDB"""
+    for chunk, embedding in zip(chunks, embeddings):
+        # Convert numpy array to list if needed
+        if isinstance(embedding, np.ndarray):
+            embedding = embedding.tolist()
+            
+        # Create document
+        document = {
+            "pdf_name": pdf_name,
+            "chunk_text": chunk,
+            "embeddings": embedding,
+            "timestamp": datetime.now()
+        }
+        
+        # Insert into MongoDB
+        collection.insert_one(document)
+    
+    return len(chunks)
 
-    # Make sure the embedding is a list for proper MongoDB storage
-    if isinstance(embeddings, np.ndarray):
-        embeddings = embeddings.tolist()
+def process_pdf(pdf_path):
+    """Process a PDF file and store its chunks and embeddings"""
+    # Extract PDF name from path
+    pdf_name = os.path.basename(pdf_path)
+    
+    # Check if PDF has already been processed
+    if collection.count_documents({"pdf_name": pdf_name}) > 0:
+        print(f"PDF {pdf_name} has already been processed.")
+        return f"PDF {pdf_name} already exists in database."
+    
+    # Extract text from PDF
+    text = extract_text_from_pdf(pdf_path)
+    
+    # Create chunks from text
+    chunks = create_text_chunks(text)
+    
+    # Generate embeddings for chunks
+    embeddings = embed_chunks(chunks)
+    
+    # Store chunks and embeddings in MongoDB
+    num_chunks = store_chunks_in_db(pdf_name, chunks, embeddings)
+    
+    return f"Successfully processed {pdf_name}: {num_chunks} chunks stored in database."
 
-    data = {
-        "pdf_name": pdf_name,
-        "chunk_text": chunk,
-        "embeddings": embeddings
-    }
-    collection.insert_one(data)
-
-def store_image_in_mongodb(pdf_name, image_path):
-    """Stores an image reference in MongoDB."""
-    data = {
-        "pdf_name": pdf_name,
-        "image_path": image_path
-    }
-    collection.insert_one(data)
-
-def store_table_in_mongodb(pdf_name, table_data):
-    """Stores a table reference in MongoDB."""
-    data = {
-        "pdf_name": pdf_name,
-        "table_data": table_data
-    }
-    collection.insert_one(data)
-
-def find_similar_chunks(query):
-    """Finds the most similar text chunk for a given query using cosine similarity."""
-    # Get query embedding as a 1D array
+def retrieve_relevant_chunks(query, top_n=5):
+    """Find the most relevant text chunks for a query using vector similarity"""
+    # Generate embedding for query
     query_embedding = np.array(embedding_model.embed_documents([query])[0])
     
-    docs = list(collection.find({}, {"chunk_text": 1, "embeddings": 1, "_id": 0}))
+    # Retrieve all chunks from database
+    all_docs = list(collection.find(
+        {}, 
+        {"chunk_text": 1, "embeddings": 1, "pdf_name": 1, "_id": 0}
+    ))
     
-    best_match = None
-    best_score = -1
+    # Calculate similarity scores
+    results = []
+    for doc in all_docs:
+        chunk_text = doc["chunk_text"]
+        chunk_embedding = np.array(doc["embeddings"])
+        pdf_name = doc["pdf_name"]
+        
+        # Calculate cosine similarity
+        similarity = cosine_similarity([query_embedding], [chunk_embedding])[0][0]
+        
+        # Add to results
+        results.append((chunk_text, similarity, pdf_name))
     
-    for doc in docs:
-        if "chunk_text" in doc and "embeddings" in doc:
-            # Ensure we're dealing with a single chunk and its embedding
-            chunk = doc["chunk_text"]
-            emb = np.array(doc["embeddings"])
-            
-            # Make sure embeddings are correctly shaped
-            if isinstance(chunk, list) and isinstance(emb, list):
-                # Handle case where we have lists of chunks and embeddings
-                for c, e in zip(chunk, emb):
-                    e = np.array(e)
-                    if e.ndim == 1:  # If embedding is already 1D
-                        score = cosine_similarity([query_embedding], [e])[0][0]
-                    else:
-                        # Try to flatten or reshape as needed
-                        e = e.flatten() if e.ndim > 2 else e
-                        score = cosine_similarity([query_embedding], [e])[0][0]
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_match = c
-            else:
-                # Handle single chunk case
-                emb = np.array(emb)
-                if emb.ndim == 1:  # If embedding is already 1D
-                    score = cosine_similarity([query_embedding], [emb])[0][0]
-                else:
-                    # Try to flatten or reshape as needed
-                    emb = emb.flatten() if emb.ndim > 2 else emb
-                    score = cosine_similarity([query_embedding], [emb])[0][0]
-                
-                if score > best_score:
-                    best_score = score
-                    best_match = chunk
+    # Sort by similarity score (descending)
+    results.sort(key=lambda x: x[1], reverse=True)
     
-    return best_match, best_score
+    # Return top matches
+    return results[:top_n]
 
-# Main processing function
-def process_pdf(pdf_path):
-    pdf_name = os.path.basename(pdf_path)
-    text = extract_text(pdf_path)
-    text_chunks = chunk_text(text)
-    embeddings = generate_embeddings(text_chunks)
-    tables = extract_tables(pdf_path)
-    images = extract_images(pdf_path)
-    # image_texts = [perform_ocr(img) for img in images]
-    # for chunk, embeddings in zip(text_chunks, embeddings):
-    #     store_text_chunk_in_mongodb(pdf_name, chunk, embeddings) #text_chunks+image_texts
-
-    for i, chunk in enumerate(text_chunks):
-        store_text_chunk_in_mongodb(pdf_name, chunk, embeddings[i])
-
-     # Store images in MongoDB
-    for img_path in images:
-        store_image_in_mongodb(pdf_name, img_path)
+def chat_with_pdf(query, user_id="default_user", session_id=None):
+    """Chat with PDF content using relevant context chunks"""
+    # Create new session ID if none provided
+    if not session_id:
+        session_id = f"{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
     
-    # Store tables in MongoDB
-    for table in tables:
-        store_table_in_mongodb(pdf_name, table)
+    # Find relevant chunks
+    relevant_chunks = retrieve_relevant_chunks(query, top_n=5)
+    
+    # Extract text and sources
+    context_texts = [chunk[0] for chunk in relevant_chunks]
+    sources = list(set([chunk[2] for chunk in relevant_chunks]))
+    
+    # Combine context chunks
+    context = "\n\n---\n\n".join(context_texts)
+    
+    # Create prompt for LLM
+    prompt = f"""
+    You are an expert document assistant that helps users understand information from PDF documents.
+    Answer the following question based on the provided context sections.
+    
+    Your answer should:
+    1. Be thorough and complete, covering all relevant information
+    2. Present information in a clear, structured format
+    3. Include all items from any lists mentioned in the context
+    4. Only use information contained in the context
+    
+    If the context doesn't contain enough information to answer the question fully, 
+    simply state: "I don't have enough information to answer that question completely."
+    
+    CONTEXT:
+    {context}
+    
+    QUESTION:
+    {query}
+    """
+    
+    # Get response from LLM
+    response = chat_model.invoke(prompt)
+    answer = response.content
+    
+    # Add source information
+    if sources:
+        answer += f"\n\nSources: {', '.join(sources)}"
+    
+    # Store conversation in chat history
+    chat_entry = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "timestamp": datetime.now(),
+        "query": query,
+        "response": answer,
+        "sources": sources
+    }
+    chat_history.insert_one(chat_entry)
+    
+    return answer, session_id
 
-    print(f"PDF {pdf_name} processed and stored in MongoDB.")
+def get_chat_history(user_id, session_id=None):
+    """Retrieve chat history for a user"""
+    query = {"user_id": user_id}
+    if session_id:
+        query["session_id"] = session_id
+    
+    history = list(chat_history.find(
+        query,
+        {"query": 1, "response": 1, "timestamp": 1, "_id": 0}
+    ).sort("timestamp", 1))
+    
+    return history
 
-# Example Usage
+def interactive_chat():
+    """Run an interactive chat session in the console"""
+    print("=" * 50)
+    print("PDF Chat Assistant")
+    print("=" * 50)
+    
+    user_id = input("Enter user ID (or press Enter for default): ") or "default_user"
+    session_id = None
+    
+    while True:
+        query = input("\nYour question (type 'exit' to quit): ")
+        
+        if query.lower() in ["exit", "quit", "q"]:
+            print("Thank you for using PDF Chat Assistant!")
+            break
+        
+        print("\nSearching documents...")
+        answer, session_id = chat_with_pdf(query, user_id, session_id)
+        
+        print("\nAssistant:")
+        print(answer)
+
+# Example usage
 if __name__ == "__main__":
-    pdf_path = r"C:\Users\HP\Desktop\V3.0\NextGenNEXA_Doc_Assistant\Missile Guidance And Control Systems.pdf"
-    process_pdf(pdf_path)
-
-    # Example Query Search
-    query = "Missile guidance systems"
-    match, score = find_similar_chunks(query)
-    print(f"Best match: {match} (Score: {score})")
+    # Process a PDF file
+    pdf_path = "testSummary.pdf"
+    result = process_pdf(pdf_path)
+    print(result)
+    
+    # Start interactive chat
+    interactive_chat()
